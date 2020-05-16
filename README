@@ -1,0 +1,59 @@
+
+                        # Unguru Dragos-Gabriel
+                            # 336CC
+
+    
+        # BRIEF INTRODUCTION
+
+    The presented project represents my implementation of
+an asynchronous WINDOWS web server using I/O Completion Ports and
+Overlapped I/O.
+
+    The server has a basic functionality of only fetching
+various demanded files (static of dynamic files).
+    The static files are transfered via zero-copying using
+the TransferFile and the dynamic files are transferred using
+overlapping WSASend as we suppose that the server needs to
+do some operations on the said file.
+
+        # IMPLEMENTATION DETAILS
+
+    The server works as a state machine, presenting the following
+states:
+
+    STATE_INIT:              The connection is initialised and
+                                 is waiting to receive the HTTP request
+
+	STATE_DATA_RECEIVED:     Request received, next step is to manage
+                                 the header of the response
+
+	STATE_DATA_SENT:         The demanded file was fully sent
+
+	STATE_DATA_PENDING:      File is beign transmitted
+
+	STATE_DATA_HEADER:       The next step for this connection is sending
+                                 the response's header
+
+	STATE_CONNECTION_CLOSED: Connection closed due to an error or due to
+                                 the file beign fully sent
+
+
+    To achieve the asynchronous behaviour, there are 3 overlapped structures
+for each connection:
+        -> For receiveing
+        -> For sending
+        -> For reading from the file (for dynamic files)
+
+    The connection_complete_socket_send() function takes care of every
+connection's next step by taking into consideration the connection's
+current state and the type of the demanded file.
+
+    Every connection's work is scheduled by making use of the
+overlapped I/O with completion routines API.
+    
+    The communication between the server and it's clients is done
+via sockets, thanks to the wsock32 socket library for Windows.
+
+
+    For further implementation details, the code is wsock32
+thoroughly commented.

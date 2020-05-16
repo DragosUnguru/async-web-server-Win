@@ -22,7 +22,7 @@ LOG_FILE=test.log
 WGET_LOG=wget.log
 
 # Enable/disable cleanup (yes/no)
-DO_CLEANUP=yes
+DO_CLEANUP=no
 
 max_points=90
 
@@ -30,7 +30,7 @@ max_points=90
 EXIT_IF_FAIL=0
 
 # Enable/disable debug (1/0)
-DEBUG_=0
+DEBUG_=1
 
 DEBUG()
 {

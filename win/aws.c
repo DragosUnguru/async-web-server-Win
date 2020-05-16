@@ -12,7 +12,9 @@
 #include "../aws.h"
 #include "../debug.h"
 
+#ifndef BUFSIZ
 #define BUFSIZ				8192
+#endif
 
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 
@@ -49,6 +51,7 @@ struct connection {
 	WSABUF send_buffers[1];
 	size_t bytes_recv;
 	size_t bytes_sent;
+	size_t bytes_read;
 	WSAOVERLAPPED recv_ov;
 	WSAOVERLAPPED send_ov;
 	OVERLAPPED read_ov;
@@ -73,20 +76,21 @@ static struct {
  * to the file.
  */
 static http_parser request_parser;
-static char request_path[BUFSIZ];	/* storage for request_path */
+static char request_path[BUFSIZ];
 
-static void connection_complete_socket_send(struct connection* conn,
-	WSAOVERLAPPED* ovp);
-static void connection_schedule_static(struct connection* conn, WSAOVERLAPPED* ovp);
-static void connection_schedule_dynamic(struct connection* conn, WSAOVERLAPPED* ovp);
+static void connection_complete_socket_send(struct connection *conn,
+	WSAOVERLAPPED *ovp);
+static void connection_schedule_static(struct connection *conn,
+	WSAOVERLAPPED *ovp);
+static void connection_schedule_dynamic(struct connection *conn);
 
 /*
  * Initialize connection structure on given socket.
  */
 
-static struct connection* connection_create(SOCKET sockfd)
+static struct connection *connection_create(SOCKET sockfd)
 {
-	struct connection* conn = malloc(sizeof(*conn));
+	struct connection *conn = malloc(sizeof(*conn));
 
 	DIE(conn == NULL, "malloc");
 
@@ -102,11 +106,13 @@ static struct connection* connection_create(SOCKET sockfd)
 	conn->fileSize = 0;
 	conn->bytes_recv = 0;
 	conn->bytes_sent = 0;
+	conn->bytes_recv = 0;
 	conn->fileType = INVALID;
 	conn->state = STATE_INIT;
 
 	ZeroMemory(&conn->recv_ov, sizeof(conn->recv_ov));
 	ZeroMemory(&conn->send_ov, sizeof(conn->send_ov));
+	ZeroMemory(&conn->read_ov, sizeof(conn->read_ov));
 
 	return conn;
 }
@@ -116,7 +122,7 @@ static struct connection* connection_create(SOCKET sockfd)
  * by AcceptEx.
  */
 
-static struct connection* connection_create_with_socket(void)
+static struct connection *connection_create_with_socket(void)
 {
 	SOCKET s;
 
@@ -130,9 +136,11 @@ static struct connection* connection_create_with_socket(void)
  * Remove connection handler.
  */
 
-static void connection_remove(struct connection* conn)
+static void connection_remove(struct connection *conn)
 {
 	closesocket(conn->sockfd);
+	if (conn->hFile != NULL)
+		CloseHandle(conn->hFile);
 	free(conn);
 }
 
@@ -141,7 +149,7 @@ static void connection_remove(struct connection* conn)
  * Request path is stored in global request_path variable.
  */
 
-static int on_path_cb(http_parser* p, const char* buf, size_t len)
+static int on_path_cb(http_parser *p, const char *buf, size_t len)
 {
 	assert(p == &request_parser);
 	memcpy(request_path, buf, len);
@@ -174,7 +182,8 @@ static http_parser_settings settings_on_path = {
  * demanded file's path received as a request
  * to the calee
  */
-static char* fetch_request_path(const char* request) {
+static void fetch_request_path(const char *request)
+{
 	size_t bytes_parsed;
 
 	/* init HTTP_REQUEST parser */
@@ -182,16 +191,22 @@ static char* fetch_request_path(const char* request) {
 	ZeroMemory(request_path, BUFSIZ);
 
 
-	bytes_parsed = http_parser_execute(&request_parser, &settings_on_path, request, strlen(request));
+	bytes_parsed = http_parser_execute(
+		&request_parser,
+		&settings_on_path,
+		request,
+		strlen(request)
+	);
 }
 
-static void put_header(struct connection* conn)
+static void put_header(struct connection *conn)
 {
 	char buffer[BUFSIZ];
 
-	sprintf(buffer, "HTTP/1.1 200 OK\r\n"
-		"Date: Sun, 08 May 2011 09:26:16 GMT\r\n"
-		"Server: Apache/2.2.9\r\n"
+	sprintf_s(buffer, BUFSIZ,
+		"^HTTP/1.1 200 OK\r\n"
+		"Date: Sun, 10 Oct 2010 23:26:07 GMT\r\n"
+		"Server: Apache/2.2.8 (Ubuntu) mod_ssl/2.2.8 OpenSSL/0.9.8g\r\n"
 		"Last-Modified: Mon, 02 Aug 2010 17:55:28 GMT\r\n"
 		"Accept-Ranges: bytes\r\n"
 		"Content-Length: %ld\r\n"
@@ -205,14 +220,15 @@ static void put_header(struct connection* conn)
 	conn->send_buffers[0].len = strlen(buffer);
 }
 
-static void put_error(struct connection* conn)
+static void put_error(struct connection *conn)
 {
-	const char buffer[] = "HTTP/1.1 404 Not Found\r\n"
+	static const char buffer[] =
+		"^HTTP/1.1 404 Not Found\r\n"
 		"Date: Sun, 08 May 2011 09:26:16 GMT\r\n"
 		"Server: Apache/2.2.9\r\n"
 		"Last-Modified: Mon, 02 Aug 2010 17:55:28 GMT\r\n"
 		"Accept-Ranges: bytes\r\n"
-		"Content-Length: 153\r\n"
+		"Content-Length: 230\r\n"
 		"Vary: Accept-Encoding\r\n"
 		"Connection: close\r\n"
 		"Content-Type: text/html\r\n"
@@ -227,7 +243,7 @@ static void put_error(struct connection* conn)
  * Use WSASend to asynchronously send message through socket.
  */
 
-static void send_buffer(struct connection* conn)
+static void send_buffer(struct connection *conn)
 {
 	DWORD flags;
 	int rc;
@@ -247,54 +263,34 @@ static void send_buffer(struct connection* conn)
 		"WSASend");
 }
 
-static void connection_schedule_socket_send(struct connection* conn, WSAOVERLAPPED* ovp)
+static void connection_schedule_socket_send(struct connection *conn)
 {
-	BOOL bRet;
-	DWORD bytesSent;
-	DWORD flags;
-
-	flags = 0;
-	bRet = WSAGetOverlappedResult(
-		conn->sockfd,
-		ovp,
-		&bytesSent,
-		FALSE,
-		&flags);
-
-	if (bytesSent) {
-		/* Send HTTP response header */
-		if (conn->fileType == INVALID) {
-			put_error(conn);
-			conn->state = STATE_DATA_SENT;
-		}
-		else {
-			put_header(conn);
-			conn->state = STATE_DATA_PENDING;
-		}
-
-		send_buffer(conn);
-
+	/* Send HTTP response header */
+	if (conn->fileType == INVALID) {
+		put_error(conn);
+		conn->state = STATE_DATA_SENT;
+	} else {
+		put_header(conn);
+		conn->state = STATE_DATA_PENDING;
 	}
+
+	send_buffer(conn);
 }
 
 /*
  * Prepare data for overlapped I/O send operation.
  */
 
-static void connection_prepare_socket_send(struct connection* conn,
-	WSAOVERLAPPED* ovp)
+static void connection_prepare_socket_send(struct connection *conn)
 {
 	DWORD fileHighSize;
-	DWORD fileSize;
-	DWORD remainingBytes;
 	char path[BUFSIZ];
-	int rc;
 
 	/* Get demanded file's name */
 	fetch_request_path(conn->recv_buffer);
 
 	/* Format path to file managing absolute path from root */
-	sprintf(path, "%s%s", AWS_DOCUMENT_ROOT, request_path + 1);
+	sprintf_s(path, BUFSIZ, "%s%s", AWS_DOCUMENT_ROOT, request_path + 1);
 
 	/* Manage file */
 	conn->hFile = CreateFile(
@@ -320,33 +316,35 @@ static void connection_prepare_socket_send(struct connection* conn,
 	conn->fileSize += fileHighSize << 8;
 
 	/* If it's a static file, send by zero-copying */
-	if (strstr(request_path, AWS_REL_STATIC_FOLDER) != NULL) {
+	if (strstr(request_path, AWS_REL_STATIC_FOLDER) != NULL)
 		conn->fileType = STATIC;
-	}
+
 	/* If it's a dynamic file, send via WSASend */
-	else if (strstr(request_path, AWS_REL_DYNAMIC_FOLDER) != NULL) {
+	else if (strstr(request_path, AWS_REL_DYNAMIC_FOLDER) != NULL)
 		conn->fileType = DYNAMIC;
-	}
 
 	conn->state = STATE_DATA_HEADER;
 }
 
-static void connection_schedule_static(struct connection* conn, WSAOVERLAPPED* ovp)
+static void connection_schedule_static(struct connection *conn,
+	WSAOVERLAPPED *ovp)
 {
 	BOOL bRet;
 	DWORD bytes_sent, flags;
 
-	/* File sent */
-	if (conn->bytes_sent == conn->fileSize) {
-		conn->state = STATE_CONNECTION_CLOSED;
-		connection_remove(conn);
-		return;
-	}
+	bRet = WSAGetOverlappedResult(
+		conn->sockfd,
+		ovp,
+		&bytes_sent,
+		FALSE,
+		&flags
+	);
+
+	conn->bytes_sent += bytes_sent;
 
 	/* Connection interrupted */
 	if (bytes_sent <= 0) {
 		conn->state = STATE_CONNECTION_CLOSED;
-		connection_remove(conn);
 		return;
 	}
 
@@ -354,7 +352,7 @@ static void connection_schedule_static(struct connection* conn, WSAOVERLAPPED* o
 		bRet = TransmitFile(
 			conn->sockfd,
 			conn->hFile,
-			conn->fileSize,
+			0,
 			0,
 			&conn->send_ov,
 			NULL,
@@ -364,25 +362,14 @@ static void connection_schedule_static(struct connection* conn, WSAOVERLAPPED* o
 
 		conn->state = STATE_DATA_PENDING;
 
-		bRet = WSAGetOverlappedResult(
-			conn->sockfd,
-			ovp,
-			&bytes_sent,
-			FALSE,
-			&flags);
-
-		conn->bytes_sent += bytes_sent;
-		//connection_complete_socket_send(conn, ovp);
-
 		return;
 	}
+
 	conn->state = STATE_DATA_SENT;
 	connection_remove(conn);
-
-	//connection_complete_socket_send(conn, ovp);
 }
 
-static void connection_schedule_dynamic(struct connection* conn, WSAOVERLAPPED* ovp)
+static void connection_schedule_dynamic(struct connection *conn)
 {
 	DWORD bytes;
 	DWORD flags;
@@ -391,11 +378,12 @@ static void connection_schedule_dynamic(struct connection* conn, WSAOVERLAPPED* 
 
 	flags = 0;
 
-	bytes = MIN(conn->fileSize - conn->bytes_sent, BUFSIZ);
+	bytes = MIN(conn->fileSize - conn->bytes_read, BUFSIZ);
 
-	if (conn->bytes_sent < conn->fileSize) {
+	if (conn->bytes_read < conn->fileSize) {
 		conn->read_ov.Offset = conn->bytes_sent;
 		conn->read_ov.OffsetHigh = 0;
+
 		bRet = ReadFile(
 			conn->hFile,
 			conn->dynamic_buffer,
@@ -403,12 +391,10 @@ static void connection_schedule_dynamic(struct connection* conn, WSAOVERLAPPED* 
 			&bytesRead,
 			&conn->read_ov
 		);
-
 		conn->state = STATE_DATA_PENDING;
+		conn->bytes_read += bytesRead;
 
-	}
-	else {
-		conn->state = STATE_DATA_SENT;
+		return;
 	}
 }
 
@@ -417,7 +403,7 @@ static void connection_schedule_dynamic(struct connection* conn, WSAOVERLAPPED* 
  * Use WSARecv to asynchronously receive message from socket.
  */
 
-static void connection_schedule_socket_receive(struct connection* conn)
+static void connection_schedule_socket_receive(struct connection *conn)
 {
 	DWORD flags;
 	int rc;
@@ -444,31 +430,32 @@ static void connection_schedule_socket_receive(struct connection* conn)
  * Port). Close connection.
  */
 
-static void connection_complete_socket_send(struct connection* conn,
-	WSAOVERLAPPED* ovp)
+static void connection_complete_socket_send(struct connection *conn,
+	WSAOVERLAPPED *ovp)
 {
 	/* Closing the socket also removes it from Completion port. */
-	if (conn->state == STATE_CONNECTION_CLOSED || conn->state == STATE_DATA_SENT) {
+	if (conn->state == STATE_CONNECTION_CLOSED ||
+		conn->state == STATE_DATA_SENT)
 		connection_remove(conn);
-	}
-	else if (conn->state == STATE_DATA_PENDING && conn->fileType == DYNAMIC) {
-		if (!conn->bytes_sent)
+
+	else if (conn->state == STATE_DATA_PENDING &&
+		conn->fileType == DYNAMIC) {
+		if (!conn->bytes_read)
 			w_iocp_add_key(iocp, conn->hFile, (ULONG_PTR)conn);
 
-		connection_schedule_dynamic(conn, ovp);
-	}
-	else if (conn->state == STATE_DATA_PENDING && conn->fileType == STATIC) {
+		connection_schedule_dynamic(conn);
+	} else if (conn->state == STATE_DATA_PENDING &&
+		conn->fileType == STATIC)
 		connection_schedule_static(conn, ovp);
-	}
-	else if (conn->state == STATE_DATA_HEADER) {
-		connection_schedule_socket_send(conn, ovp);
-	}
-	else if (conn->state == STATE_DATA_RECEIVED) {
-		connection_prepare_socket_send(conn, ovp);
-	}
-	else if (conn->state == STATE_INIT) {
+
+	else if (conn->state == STATE_DATA_HEADER)
+		connection_schedule_socket_send(conn);
+
+	else if (conn->state == STATE_DATA_RECEIVED)
+		connection_prepare_socket_send(conn);
+
+	else if (conn->state == STATE_INIT)
 		connection_schedule_socket_receive(conn);
-	}
 }
 
 /*
@@ -476,28 +463,32 @@ static void connection_complete_socket_send(struct connection* conn,
  * Port). Send message back.
  */
 
-static void connection_complete_socket_receive(struct connection* conn,
-	WSAOVERLAPPED* ovp)
+static void connection_complete_socket_receive(struct connection *conn,
+	WSAOVERLAPPED *ovp)
 {
 	BOOL bRet;
 	DWORD flags;
+	DWORD recvBytes;
 
 	bRet = WSAGetOverlappedResult(
 		conn->sockfd,
 		ovp,
-		&conn->bytes_recv,
+		&recvBytes,
 		FALSE,
-		&flags);
+		&flags
+	);
 	DIE(bRet == FALSE, "WSAGetOverlappedResult");
 
+	conn->bytes_recv += recvBytes;
+
 	/* In case of no bytes received, consider connection terminated. */
-	if (conn->bytes_recv == 0) {
+	if (recvBytes <= 0) {
 		connection_remove(conn);
 		return;
 	}
 
-	connection_prepare_socket_send(conn, ovp);
-	connection_schedule_socket_send(conn, ovp);
+	connection_prepare_socket_send(conn);
+	connection_schedule_socket_send(conn);
 }
 
 /*
@@ -522,7 +513,7 @@ static void create_iocp_accept(void)
 		0,
 		128,
 		128,
-		&ac.len,
+		(LPDWORD) & ac.len,
 		&ac.ov);
 	DIE(bRet == FALSE && WSAGetLastError() != ERROR_IO_PENDING, "AcceptEx");
 }
@@ -531,9 +522,9 @@ static void create_iocp_accept(void)
  * Handle a new connection request on the server socket.
  */
 
-static void handle_new_connection(OVERLAPPED* ovp)
+static void handle_new_connection(void)
 {
-	struct connection* conn;
+	struct connection *conn;
 	char abuffer[64];
 	HANDLE hRet;
 	int rc;
@@ -542,7 +533,7 @@ static void handle_new_connection(OVERLAPPED* ovp)
 		ac.sockfd,
 		SOL_SOCKET,
 		SO_UPDATE_ACCEPT_CONTEXT,
-		(char*)&listenfd,
+		(char *)&listenfd,
 		sizeof(listenfd)
 	);
 	DIE(rc < 0, "setsockopt");
@@ -552,8 +543,6 @@ static void handle_new_connection(OVERLAPPED* ovp)
 		ERR("get_peer_address");
 		return;
 	}
-
-	//dlog(LOG_DEBUG, "Accepted connection from %s\n", abuffer);
 
 	/* Instantiate new connection handler. */
 	conn = connection_create(ac.sockfd);
@@ -574,30 +563,45 @@ static void handle_new_connection(OVERLAPPED* ovp)
  * has been sent to the socket.
  */
 
-static void handle_aio(struct connection* conn, size_t bytes, OVERLAPPED* ovp)
+static void handle_aio(struct connection *conn, OVERLAPPED *ovp)
 {
 	BOOL bRet;
-	DWORD bytesRead;
-	DWORD flags = 0;
+	DWORD bytesRead = 0;
 
-	if (ovp == &conn->send_ov) {
+	if (ovp == &conn->send_ov)
 		connection_complete_socket_send(conn, ovp);
-	}
-	else if (ovp == &conn->recv_ov) {
+
+	else if (ovp == &conn->recv_ov)
 		connection_complete_socket_receive(conn, ovp);
-	}
+
 	else if (ovp == &conn->read_ov) {
-		bRet = GetOverlappedResult(conn->hFile, &conn->read_ov, &bytesRead, FALSE, flags);
+		/* Get no. of read bytes */
+		bRet = GetOverlappedResult(
+			conn->hFile,
+			&conn->read_ov,
+			&bytesRead,
+			FALSE
+		);
 		conn->bytes_sent += bytesRead;
+
+		/* Connection terminated */
+		if (!bytesRead) {
+			connection_remove(conn);
+			return;
+		}
+
+		/* Manage read and sending buffers */
 		ZeroMemory(conn->send_buffer, BUFSIZ);
 		memcpy(conn->send_buffer, conn->dynamic_buffer, bytesRead);
 		ZeroMemory(conn->dynamic_buffer, BUFSIZ);
+
+		/* Send read data */
 		conn->send_buffers[0].len = bytesRead;
 		conn->send_buffers[0].buf = conn->send_buffer;
 		send_buffer(conn);
-		if (conn->bytes_sent == conn->fileSize) {
-			connection_remove(conn);
-		}
+
+		if (conn->bytes_sent == conn->fileSize)
+			conn->state = STATE_DATA_SENT;
 	}
 }
 
@@ -622,12 +626,9 @@ int main(void)
 	/* Use AcceptEx to schedule new connection acceptance. */
 	create_iocp_accept();
 
-	/*dlog(LOG_INFO, "Server waiting for connections on port %d\n",
-		AWS_LISTEN_PORT);*/
-
 	/* server main loop */
 	while (1) {
-		OVERLAPPED* ovp;
+		OVERLAPPED *ovp;
 		ULONG_PTR key;
 		DWORD bytes;
 
@@ -639,7 +640,7 @@ int main(void)
 
 			err = GetLastError();
 			if (err == ERROR_NETNAME_DELETED) {
-				connection_remove((struct connection*) key);
+				connection_remove((struct connection *) key);
 				continue;
 			}
 			DIE(bRet == FALSE, "w_iocp_wait");
@@ -651,13 +652,10 @@ int main(void)
 		 *   - socket communication (on connection sockets).
 		 */
 
-		if (key == listenfd) {
-			/*dlog(LOG_DEBUG, "New connection\n");*/
-			handle_new_connection(ovp);
-		}
-		else {
-			handle_aio((struct connection*) key, bytes, ovp);
-		}
+		if (key == listenfd)
+			handle_new_connection();
+		else
+			handle_aio((struct connection *) key, ovp);
 	}
 
 	wsa_cleanup();

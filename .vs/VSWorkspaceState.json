@@ -4,10 +4,8 @@
     "\\checker-win",
     "\\checker-win\\_test",
     "\\http-parser",
-    "\\http-parser\\samples",
-    "\\win",
-    "\\win\\samples"
+    "\\win"
   ],
-  "SelectedNode": "\\win\\samples\\http_reply_once.c",
+  "SelectedNode": "\\Makefile",
   "PreviewInSolutionExplorer": false
 }
